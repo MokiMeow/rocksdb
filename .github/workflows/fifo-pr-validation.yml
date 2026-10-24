@@ -1,0 +1,43 @@
+name: Filesystem validation for RocksDB PR 15383
+
+on:
+  push:
+    branches: [validation/fifo-15383]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-env-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: b3b115c45f6843db6eaa6abc5673ac1ce1f492eb
+      - name: Verify tested commit and filesystem
+        run: |
+          test "$(git rev-parse HEAD)" = b3b115c45f6843db6eaa6abc5673ac1ce1f492eb
+          stat -f -c '%T %m' . /tmp
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libsnappy-dev zlib1g-dev libbz2-dev libgflags-dev liblz4-dev libzstd-dev
+      - name: Build the native environment tests
+        run: |
+          set -o pipefail
+          AUTO_CLEAN=1 make -j"$(nproc)" env_test 2>&1 | tee env-test-build.log
+      - name: Run the complete native environment suite
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/rocksdb-tests" "$GITHUB_WORKSPACE/ioctl-tests"
+          TEST_TMPDIR="$RUNNER_TEMP/rocksdb-tests" TEST_IOCTL_FRIENDLY_TMPDIR="$GITHUB_WORKSPACE/ioctl-tests" timeout 60 ./env_test 2>&1 | tee env-tests.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-env-validation
+          path: |
+            env-test-build.log
+            env-tests.log
+          retention-days: 7
