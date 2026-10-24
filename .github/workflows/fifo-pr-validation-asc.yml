@@ -1,0 +1,89 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# This source code is licensed under both the GPLv2 (found in the
+# COPYING file in the root directory) and Apache 2.0 License
+# (found in the LICENSE.Apache file in the root directory).
+name: Checked-status filesystem validation for RocksDB PR 15383
+
+on:
+  push:
+    branches: [validation/fifo-15383-asc]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-env-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: b3b115c45f6843db6eaa6abc5673ac1ce1f492eb
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libsnappy-dev zlib1g-dev libbz2-dev libgflags-dev liblz4-dev libzstd-dev
+      - name: Build the checked-status environment tests
+        run: |
+          set -o pipefail
+          test "$(git rev-parse HEAD)" = b3b115c45f6843db6eaa6abc5673ac1ce1f492eb
+          AUTO_CLEAN=1 ASSERT_STATUS_CHECKED=1 make -j"$(nproc)" env_test 2>&1 | tee env-test-build.log
+      - name: Run every environment case in its own process
+        run: |
+          ulimit -c 0
+          mkdir -p "$GITHUB_WORKSPACE/ioctl-tests"
+          export TEST_IOCTL_FRIENDLY_TMPDIR="$GITHUB_WORKSPACE/ioctl-tests"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import tempfile
+
+          listing = subprocess.check_output(['./env_test', '--gtest_list_tests'], text=True)
+          suite = ''
+          cases = []
+          for line in listing.splitlines():
+              name = line.split('#', 1)[0].strip()
+              if not name:
+                  continue
+              if not line.startswith(' '):
+                  suite = name
+              elif 'DISABLED_' not in suite + name:
+                  cases.append(suite + name)
+          results = []
+          with Path('env-tests.log').open('w') as log:
+              for case in cases:
+                  directory = tempfile.mkdtemp(prefix='rocksdb-case-', dir=os.environ['RUNNER_TEMP'])
+                  env = dict(os.environ, TEST_TMPDIR=directory)
+                  try:
+                      result = subprocess.run(['./env_test', '--gtest_filter=' + case], env=env, capture_output=True, text=True, timeout=60)
+                      code = result.returncode
+                      log.write(result.stdout + result.stderr)
+                  except subprocess.TimeoutExpired as error:
+                      code = 124
+                      log.write('TIMEOUT ' + case + '\n')
+                      for output in (error.stdout, error.stderr):
+                          if output:
+                              log.write(output.decode(errors='replace') if isinstance(output, bytes) else output)
+                  finally:
+                      shutil.rmtree(directory, ignore_errors=True)
+                  results.append({'case': case, 'exit_code': code})
+                  print(('PASS ' if code == 0 else 'FAIL ') + case, flush=True)
+                  log.flush()
+          Path('env-test-results.json').write_text(json.dumps(results, indent=2))
+          failed = [result for result in results if result['exit_code']]
+          print(json.dumps({'cases': len(results), 'failed': failed}))
+          raise SystemExit(bool(failed))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: checked-status-env-validation
+          path: |
+            env-test-build.log
+            env-tests.log
+            env-test-results.json
+          retention-days: 7
